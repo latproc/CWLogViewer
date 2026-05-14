@@ -142,6 +142,15 @@ def first_timestamp_str(path: str) -> Optional[str]:
     return extract_ts_bytes(line).decode("ascii") if extract_ts_bytes(line) else None
 
 
+def last_timestamp_str(path: str) -> Optional[str]:
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        _, line = last_timestamped_line(f, size)
+    if not line:
+        return None
+    return extract_ts_bytes(line).decode("ascii") if extract_ts_bytes(line) else None
+
+
 def extract_ts_bytes(line: bytes) -> Optional[bytes]:
     if len(line) < 16:
         return None
@@ -349,6 +358,9 @@ class Viewer:
         self.last_search_forward = True
         self.follow_mode = False
         self.session_name = (session_name or "").strip()
+        self._rows_cache_key: Optional[tuple] = None
+        self._center_ts_cache_off: Optional[int] = None
+        self._center_ts_cache_value: Optional[str] = None
         if self.session_name:
             session = self.find_session(self.session_name)
             self.apply_session(session, goto, seek_debug)
@@ -384,6 +396,15 @@ class Viewer:
         self.config["local_time"] = self.local_time
         self.config["sessions"] = self.sessions
         save_config(self.config)
+
+    def save_active_session_state(self) -> None:
+        if self.session_name:
+            self.record_session(self.session_name)
+
+    def invalidate_cache(self) -> None:
+        self._rows_cache_key = None
+        self._center_ts_cache_off = None
+        self._center_ts_cache_value = None
 
     def remember_include(self, value: str) -> None:
         self.include_history = add_history(self.include_history, value)
@@ -485,44 +506,76 @@ class Viewer:
             return False
         return True
 
-    def set_center(self, off: int, message: str) -> None:
+    def set_center(self, off: int, message: str, save: bool = False) -> None:
         self.center_off = max(0, min(off, max(0, self.size)))
         self.cursor = 0
         self.rows = []
         self.message = message
+        self.invalidate_cache()
+        if save:
+            self.save_active_session_state()
+
+    def refresh_size(self) -> None:
+        current_size = os.path.getsize(self.path)
+        if current_size != self.size:
+            self.size = current_size
+            self.invalidate_cache()
 
     def center_ts(self) -> Optional[str]:
+        if self._center_ts_cache_off == self.center_off:
+            return self._center_ts_cache_value
         with open(self.path, "rb") as f:
             _, bline = read_line_at(f, self.center_off, self.size)
         if not bline:
+            self._center_ts_cache_off = self.center_off
+            self._center_ts_cache_value = None
             return None
-        return extract_ts_str(bline.decode("utf-8", "replace"))
+        value = extract_ts_str(bline.decode("utf-8", "replace"))
+        self._center_ts_cache_off = self.center_off
+        self._center_ts_cache_value = value
+        return value
 
     def top_offset(self) -> int:
         return 0
 
     def bottom_offset(self) -> int:
+        self.refresh_size()
         if self.size <= 0:
             return 0
         with open(self.path, "rb") as f:
             return line_start_before(f, self.size, self.size)
 
     def follow_offset(self) -> int:
+        self.refresh_size()
         return self.bottom_offset()
 
     def enter_follow(self) -> None:
         self.follow_mode = True
-        self.center_off = self.follow_offset()
-        self.cursor = 0
-        self.message = "Follow mode"
+        self.set_center(self.follow_offset(), "Follow mode")
+        self.save_active_session_state()
 
     def stop_follow(self) -> None:
         if self.follow_mode:
             self.follow_mode = False
             self.message = "Follow stopped"
+            self.save_active_session_state()
 
     def build_rows(self, height: int) -> None:
+        self.refresh_size()
         self.compile_filters()
+        cache_key = (
+            self.size,
+            self.center_off,
+            height,
+            self.window_secs,
+            self.raw_secs,
+            self.raw_mode,
+            self.include_pat,
+            self.exclude_pat,
+        )
+        if self._rows_cache_key == cache_key:
+            return
+
         ts = self.center_ts()
         max_body = max(1, height)
         # Keep the selected timestamp visible even in very dense logs.
@@ -553,15 +606,29 @@ class Viewer:
                 dst.append(Row(off, text))
             return True
 
-        rows_before: list[Row] = []
-        rows_after: list[Row] = []
-        center_row: list[Row] = []
-        truncated_before = False
-        truncated_after = False
+        def scan_window(secs: float) -> list[Row]:
+            rows_before: list[Row] = []
+            rows_after: list[Row] = []
+            center_row: list[Row] = []
+            truncated_before = False
+            truncated_after = False
 
-        if ts:
+            if not ts:
+                rows: list[Row] = []
+                with open(self.path, "rb") as f:
+                    start = line_start_before(f, self.center_off, self.size)
+                    f.seek(start)
+                    while len(rows) < max_rows:
+                        off = f.tell()
+                        bline = f.readline()
+                        if not bline:
+                            break
+                        text = decode_line(bline)
+                        if self.raw_mode or self.row_matches(text):
+                            rows.append(Row(off, text))
+                return rows
+
             cdt = ts_to_dt(ts)
-            secs = self.raw_secs if self.raw_mode else self.window_secs
             lo_ts = dt_to_ts(cdt - _dt.timedelta(seconds=secs))
             hi_ts = dt_to_ts(cdt + _dt.timedelta(seconds=secs))
 
@@ -586,7 +653,6 @@ class Viewer:
                     if prev == 0:
                         break
                     pos = prev
-                # If we stopped due to cap, record that there may be more rows.
                 if pos > 0 and len(rows_before) >= before_target:
                     truncated_before = True
 
@@ -619,23 +685,42 @@ class Viewer:
             rows.extend(rows_after)
             if truncated_after:
                 rows.append(Row(-1, "--- later rows omitted; narrow the time window/filter or page/search forward ---"))
+            return rows
+
+        def visible_count(rows: list[Row]) -> int:
+            return sum(1 for r in rows if r.off >= 0)
+
+        if ts:
+            secs = self.raw_secs if self.raw_mode else self.window_secs
+            rows = scan_window(secs)
+            max_secs = None
+            first_ts = first_timestamp_str(self.path)
+            last_ts = last_timestamp_str(self.path)
+            if first_ts or last_ts:
+                cdt = ts_to_dt(ts)
+                limits = [secs]
+                if first_ts:
+                    limits.append(abs((cdt - ts_to_dt(first_ts)).total_seconds()))
+                if last_ts:
+                    limits.append(abs((cdt - ts_to_dt(last_ts)).total_seconds()))
+                max_secs = max(limits)
+            target_visible = max(1, min(max_body, max(4, max_body // 2)))
+            # Expand outward until we surface enough visible rows, or we reach
+            # the bounds of the file/time span.
+            while visible_count(rows) < target_visible and max_secs is not None and secs < max_secs:
+                next_secs = min(max_secs, max(secs * 2.0, secs + 1.0))
+                if next_secs == secs:
+                    break
+                secs = next_secs
+                rows = scan_window(secs)
+            if visible_count(rows) == 0:
+                rows = [Row(-1, "No rows match current filter in this time range")]
         else:
-            # Non-timestamp fallback: show nearby lines.
-            rows = []
-            with open(self.path, "rb") as f:
-                start = line_start_before(f, self.center_off, self.size)
-                f.seek(start)
-                while len(rows) < max_rows:
-                    off = f.tell()
-                    bline = f.readline()
-                    if not bline:
-                        break
-                    text = decode_line(bline)
-                    if self.raw_mode or self.row_matches(text):
-                        rows.append(Row(off, text))
+            rows = scan_window(0.0)
 
         old_off = self.rows[self.cursor].off if self.rows and 0 <= self.cursor < len(self.rows) else self.center_off
         self.rows = rows
+        self._rows_cache_key = cache_key
         # Put cursor on current center if visible; otherwise closest offset.
         self.cursor = 0
         if self.rows:
@@ -656,23 +741,30 @@ class Viewer:
     def move_cursor(self, delta: int) -> None:
         if not self.rows:
             return
-        self.cursor = max(0, min(len(self.rows) - 1, self.cursor + delta))
+        new_cursor = max(0, min(len(self.rows) - 1, self.cursor + delta))
+        if new_cursor == self.cursor:
+            if delta < 0 and self.cursor == 0 and self.rows[self.cursor].off >= 0:
+                self.set_center(self.rows[self.cursor].off, self.message)
+            elif delta > 0 and self.cursor == len(self.rows) - 1 and self.rows[self.cursor].off >= 0:
+                self.set_center(self.rows[self.cursor].off, self.message)
+            return
+        self.cursor = new_cursor
         if self.rows[self.cursor].off >= 0:
-            self.center_off = self.rows[self.cursor].off
+            self.save_active_session_state()
 
     def jump_time(self, ts: str) -> None:
         jump_ts = parse_jump_ts(ts, assume_local=self.local_time)
-        self.set_center(find_ts_offset(self.path, jump_ts), "")
+        self.set_center(find_ts_offset(self.path, jump_ts), "", save=True)
         if self.local_time and not ts.strip().endswith("Z"):
             self.message = f"Jumped to local {ts.strip()}"
         else:
             self.message = f"Jumped to {normalize_ts(jump_ts)}"
 
     def jump_top(self) -> None:
-        self.set_center(self.top_offset(), "Top of file")
+        self.set_center(self.top_offset(), "Top of file", save=True)
 
     def jump_bottom(self) -> None:
-        self.set_center(self.bottom_offset(), "Bottom of file")
+        self.set_center(self.bottom_offset(), "Bottom of file", save=True)
 
     def tick_follow(self) -> None:
         if self.follow_mode:
@@ -682,6 +774,7 @@ class Viewer:
         self.local_time = not self.local_time
         self.message = "Local time on" if self.local_time else "Local time off"
         self.save_filter_state()
+        self.save_active_session_state()
 
     def display_ts(self) -> str:
         ts = self.center_ts()
@@ -711,7 +804,7 @@ class Viewer:
                     return False
                 text = bline.decode("utf-8", "replace").rstrip("\n")
                 if rx.search(text):
-                    self.set_center(off, f"Found forward: {pat}")
+                    self.set_center(off, f"Found forward: {pat}", save=True)
                     return True
 
     def search_backward(self, pat: str) -> bool:
@@ -740,7 +833,7 @@ class Viewer:
                 for off, ln in reversed(list(zip(offsets, lines))):
                     text = ln.decode("utf-8", "replace").rstrip("\n")
                     if rx.search(text):
-                        self.set_center(off, f"Found backward: {pat}")
+                        self.set_center(off, f"Found backward: {pat}", save=True)
                         return True
                 end = start
         return False
@@ -1010,6 +1103,7 @@ def main_curses(stdscr, v: Viewer) -> None:
                     v.remember_include(s)
                 else:
                     v.save_filters()
+                v.save_active_session_state()
         elif ch == ord("x"):
             s = prompt(stdscr, "exclude regex", v.exclude_pat, v.exclude_history)
             if s is not None:
@@ -1019,11 +1113,13 @@ def main_curses(stdscr, v: Viewer) -> None:
                     v.remember_exclude(s)
                 else:
                     v.save_filters()
+                v.save_active_session_state()
         elif ch == ord("c"):
             v.include_pat = ""
             v.exclude_pat = ""
             v.compile_filters()
             v.save_filters()
+            v.save_active_session_state()
         elif ch == ord("s"):
             choice = pick_session(stdscr, "save session", v.sessions, v.session_name)
             if choice is not None:
@@ -1039,6 +1135,7 @@ def main_curses(stdscr, v: Viewer) -> None:
                             v.message = f"Saved session: {name}"
         elif ch == ord("r"):
             v.raw_mode = not v.raw_mode
+            v.save_active_session_state()
         elif ch == ord("t"):
             v.toggle_local_time()
         elif ch == ord("w"):
@@ -1046,6 +1143,7 @@ def main_curses(stdscr, v: Viewer) -> None:
             if s:
                 try:
                     v.window_secs = float(s)
+                    v.save_active_session_state()
                 except ValueError:
                     v.message = "bad number"
         elif ch == ord("R"):
@@ -1053,6 +1151,7 @@ def main_curses(stdscr, v: Viewer) -> None:
             if s:
                 try:
                     v.raw_secs = float(s)
+                    v.save_active_session_state()
                 except ValueError:
                     v.message = "bad number"
         elif ch == ord("F"):
