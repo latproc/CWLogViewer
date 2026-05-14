@@ -352,6 +352,9 @@ class Viewer:
         self.local_time = bool(self.config.get("local_time", False))
         self.sessions = clean_sessions(self.config.get("sessions", []))
         self.rows: list[Row] = []
+        self.rows_truncated_before = False
+        self.rows_truncated_after = False
+        self.body_height = 0
         self.cursor = 0
         self.message = ""
         self.last_search = ""
@@ -361,6 +364,9 @@ class Viewer:
         self._rows_cache_key: Optional[tuple] = None
         self._center_ts_cache_off: Optional[int] = None
         self._center_ts_cache_value: Optional[str] = None
+        self._focus_off: Optional[int] = None
+        self.view_top = 0
+        self._recenter_view = True
         if self.session_name:
             session = self.find_session(self.session_name)
             self.apply_session(session, goto, seek_debug)
@@ -481,13 +487,14 @@ class Viewer:
         name = name.strip()
         if not name:
             return
+        focus_off = self.selected_offset()
         entry = {
             "name": name,
             "path": self.path,
             "saved_at": _dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
-            "center_off": self.center_off,
-            "center_ts": self.center_ts(),
-            "goto_ts": self.center_ts(),
+            "center_off": focus_off,
+            "center_ts": self.center_ts_at(focus_off),
+            "goto_ts": self.center_ts_at(focus_off),
             "include_pat": self.include_pat,
             "exclude_pat": self.exclude_pat,
             "window_secs": self.window_secs,
@@ -499,6 +506,13 @@ class Viewer:
         self.sessions = sessions[:MAX_SESSIONS]
         self.save_ui_state()
 
+    def center_ts_at(self, off: int) -> Optional[str]:
+        with open(self.path, "rb") as f:
+            _, bline = read_line_at(f, off, self.size)
+        if not bline:
+            return None
+        return extract_ts_str(bline.decode("utf-8", "replace"))
+
     def row_matches(self, text: str) -> bool:
         if self.include_re and not self.include_re.search(text):
             return False
@@ -506,10 +520,20 @@ class Viewer:
             return False
         return True
 
-    def set_center(self, off: int, message: str, save: bool = False) -> None:
+    def set_center(
+        self,
+        off: int,
+        message: str,
+        save: bool = False,
+        focus_off: Optional[int] = None,
+    ) -> None:
         self.center_off = max(0, min(off, max(0, self.size)))
         self.cursor = 0
         self.rows = []
+        self.rows_truncated_before = False
+        self.rows_truncated_after = False
+        self._focus_off = focus_off if focus_off is not None else self.center_off
+        self._recenter_view = True
         self.message = message
         self.invalidate_cache()
         if save:
@@ -551,7 +575,8 @@ class Viewer:
 
     def enter_follow(self) -> None:
         self.follow_mode = True
-        self.set_center(self.follow_offset(), "Follow mode")
+        off = self.follow_offset()
+        self.set_center(off, "Follow mode", focus_off=off)
         self.save_active_session_state()
 
     def stop_follow(self) -> None:
@@ -563,6 +588,9 @@ class Viewer:
     def build_rows(self, height: int) -> None:
         self.refresh_size()
         self.compile_filters()
+        self.body_height = max(0, height)
+        truncated_before = False
+        truncated_after = False
         cache_key = (
             self.size,
             self.center_off,
@@ -582,7 +610,9 @@ class Viewer:
         # We collect rows on both sides of center_off rather than scanning
         # from the start of the whole time window, which can otherwise fill
         # the display before reaching the target timestamp.
-        max_rows = max(300, min(2000, max_body * 40))
+        # Allow a much deeper slice for dense filtered logs so the view can
+        # keep pulling matching rows instead of truncating too early.
+        max_rows = max(500, min(10000, max_body * 200))
         before_target = max_rows // 2
         after_target = max_rows - before_target
 
@@ -607,6 +637,7 @@ class Viewer:
             return True
 
         def scan_window(secs: float) -> list[Row]:
+            nonlocal truncated_before, truncated_after
             rows_before: list[Row] = []
             rows_after: list[Row] = []
             center_row: list[Row] = []
@@ -718,9 +749,20 @@ class Viewer:
         else:
             rows = scan_window(0.0)
 
-        old_off = self.rows[self.cursor].off if self.rows and 0 <= self.cursor < len(self.rows) else self.center_off
+        old_off = self._focus_off if self._focus_off is not None else (
+            self.rows[self.cursor].off if self.rows and 0 <= self.cursor < len(self.rows) else self.center_off
+        )
         self.rows = rows
+        self.rows_truncated_before = truncated_before
+        self.rows_truncated_after = truncated_after
         self._rows_cache_key = cache_key
+        self._focus_off = None
+        max_start = max(0, len(self.rows) - max_body)
+        if self._recenter_view or self.view_top > max_start:
+            self.view_top = max(0, min(self.cursor - max_body // 2, max_start))
+            self._recenter_view = False
+        else:
+            self.view_top = max(0, min(self.view_top, max_start))
         # Put cursor on current center if visible; otherwise closest offset.
         self.cursor = 0
         if self.rows:
@@ -732,43 +774,163 @@ class Viewer:
                 if d < best_d:
                     best_i, best_d = i, d
             self.cursor = best_i
+        self._ensure_cursor_visible()
+
+    def _ensure_cursor_visible(self) -> None:
+        max_body = max(1, self.body_height or 1)
+        max_start = max(0, len(self.rows) - max_body)
+        if self.cursor < self.view_top:
+            self.view_top = self.cursor
+        elif self.cursor >= self.view_top + max_body:
+            self.view_top = self.cursor - max_body + 1
+        self.view_top = max(0, min(self.view_top, max_start))
 
     def selected_offset(self) -> int:
         if self.rows and 0 <= self.cursor < len(self.rows) and self.rows[self.cursor].off >= 0:
             return self.rows[self.cursor].off
         return self.center_off
 
+    def next_line_offset(self, off: int) -> int:
+        self.refresh_size()
+        with open(self.path, "rb") as f:
+            _, bline = read_line_at(f, off, self.size)
+        if not bline:
+            return self.size
+        return min(self.size, off + len(bline))
+
+    def prev_line_offset(self, off: int) -> int:
+        self.refresh_size()
+        if off <= 0:
+            return 0
+        with open(self.path, "rb") as f:
+            return line_start_before(f, off - 1, self.size)
+
+    def next_visible_offset(self, off: int) -> int:
+        self.refresh_size()
+        with open(self.path, "rb") as f:
+            pos = self.next_line_offset(off)
+            while pos < self.size:
+                _, bline = read_line_at(f, pos, self.size)
+                if not bline:
+                    return self.size
+                text = bline.decode("utf-8", "replace").rstrip("\n")
+                if self.raw_mode or self.row_matches(text):
+                    return pos
+                pos = self.next_line_offset(pos)
+        return self.size
+
+    def prev_visible_offset(self, off: int) -> int:
+        self.refresh_size()
+        if off <= 0:
+            return 0
+        with open(self.path, "rb") as f:
+            pos = off
+            while pos > 0:
+                prev = self.prev_line_offset(pos)
+                if prev == pos:
+                    break
+                _, bline = read_line_at(f, prev, self.size)
+                if not bline:
+                    return 0
+                text = bline.decode("utf-8", "replace").rstrip("\n")
+                if self.raw_mode or self.row_matches(text):
+                    return prev
+                pos = prev
+        return 0
+
+    def page_forward(self) -> bool:
+        if not self.rows:
+            return False
+        visible = [i for i, r in enumerate(self.rows) if r.off >= 0]
+        if not visible:
+            return False
+        if self.cursor in visible:
+            current_pos = visible.index(self.cursor)
+        else:
+            current_pos = 0
+        span = max(1, (self.body_height or len(visible)) - 1)
+        target_pos = current_pos + span
+        if 0 <= target_pos < len(visible):
+            self.cursor = visible[target_pos]
+            self.view_top = min(max(0, len(self.rows) - max(1, self.body_height or 1)), self.view_top + span)
+            self.save_active_session_state()
+            return True
+        if not self.rows_truncated_after:
+            return False
+        last_off = self.rows[visible[-1]].off
+        next_off = self.next_visible_offset(last_off)
+        if next_off >= self.size or next_off == last_off:
+            return False
+        self.set_center(next_off, "Page forward", save=True, focus_off=next_off)
+        return True
+
+    def page_backward(self) -> bool:
+        if not self.rows:
+            return False
+        visible = [i for i, r in enumerate(self.rows) if r.off >= 0]
+        if not visible:
+            return False
+        if self.cursor in visible:
+            current_pos = visible.index(self.cursor)
+        else:
+            current_pos = 0
+        span = max(1, (self.body_height or len(visible)) - 1)
+        target_pos = current_pos - span
+        if 0 <= target_pos < len(visible):
+            self.cursor = visible[target_pos]
+            self.view_top = max(0, self.view_top - span)
+            self.save_active_session_state()
+            return True
+        if not self.rows_truncated_before:
+            return False
+        first_off = self.rows[visible[0]].off
+        prev_off = self.prev_visible_offset(first_off)
+        if prev_off == first_off:
+            return False
+        self.set_center(prev_off, "Page backward", save=True, focus_off=prev_off)
+        return True
+
     def move_cursor(self, delta: int) -> None:
         if not self.rows:
             return
         new_cursor = max(0, min(len(self.rows) - 1, self.cursor + delta))
         if new_cursor == self.cursor:
-            if delta < 0 and self.cursor == 0 and self.rows[self.cursor].off >= 0:
-                self.set_center(self.rows[self.cursor].off, self.message)
-            elif delta > 0 and self.cursor == len(self.rows) - 1 and self.rows[self.cursor].off >= 0:
-                self.set_center(self.rows[self.cursor].off, self.message)
+            if self.rows[self.cursor].off >= 0:
+                if delta < 0 and self.cursor == 0:
+                    prev_off = self.prev_visible_offset(self.rows[self.cursor].off)
+                    if prev_off != self.rows[self.cursor].off:
+                        self.set_center(prev_off, self.message, save=True, focus_off=prev_off)
+                elif delta > 0 and self.cursor == len(self.rows) - 1:
+                    next_off = self.next_visible_offset(self.rows[self.cursor].off)
+                    if next_off != self.rows[self.cursor].off and next_off < self.size:
+                        self.set_center(next_off, self.message, save=True, focus_off=next_off)
             return
         self.cursor = new_cursor
         if self.rows[self.cursor].off >= 0:
+            self._ensure_cursor_visible()
             self.save_active_session_state()
 
     def jump_time(self, ts: str) -> None:
         jump_ts = parse_jump_ts(ts, assume_local=self.local_time)
-        self.set_center(find_ts_offset(self.path, jump_ts), "", save=True)
+        off = find_ts_offset(self.path, jump_ts)
+        self.set_center(off, "", save=True, focus_off=off)
         if self.local_time and not ts.strip().endswith("Z"):
             self.message = f"Jumped to local {ts.strip()}"
         else:
             self.message = f"Jumped to {normalize_ts(jump_ts)}"
 
     def jump_top(self) -> None:
-        self.set_center(self.top_offset(), "Top of file", save=True)
+        off = self.top_offset()
+        self.set_center(off, "Top of file", save=True, focus_off=off)
 
     def jump_bottom(self) -> None:
-        self.set_center(self.bottom_offset(), "Bottom of file", save=True)
+        off = self.bottom_offset()
+        self.set_center(off, "Bottom of file", save=True, focus_off=off)
 
     def tick_follow(self) -> None:
         if self.follow_mode:
-            self.set_center(self.follow_offset(), "Follow mode")
+            off = self.follow_offset()
+            self.set_center(off, "Follow mode", focus_off=off)
 
     def toggle_local_time(self) -> None:
         self.local_time = not self.local_time
@@ -804,7 +966,7 @@ class Viewer:
                     return False
                 text = bline.decode("utf-8", "replace").rstrip("\n")
                 if rx.search(text):
-                    self.set_center(off, f"Found forward: {pat}", save=True)
+                    self.set_center(off, f"Found forward: {pat}", save=True, focus_off=off)
                     return True
 
     def search_backward(self, pat: str) -> bool:
@@ -833,7 +995,7 @@ class Viewer:
                 for off, ln in reversed(list(zip(offsets, lines))):
                     text = ln.decode("utf-8", "replace").rstrip("\n")
                     if rx.search(text):
-                        self.set_center(off, f"Found backward: {pat}", save=True)
+                        self.set_center(off, f"Found backward: {pat}", save=True, focus_off=off)
                         return True
                 end = start
         return False
@@ -1015,8 +1177,8 @@ def draw(stdscr, v: Viewer) -> None:
 
     max_body = h - 3
     if v.rows:
-        # Scroll so cursor is visible near middle.
-        start = max(0, min(v.cursor - max_body // 2, max(0, len(v.rows) - max_body)))
+        # Render the current viewport instead of recentering every redraw.
+        start = max(0, min(v.view_top, max(0, len(v.rows) - max_body)))
         for y, idx in enumerate(range(start, min(len(v.rows), start + max_body)), start=2):
             row = v.rows[idx]
             attr = curses.A_REVERSE if idx == v.cursor else curses.A_NORMAL
@@ -1078,9 +1240,11 @@ def main_curses(stdscr, v: Viewer) -> None:
         elif ch == curses.KEY_DOWN:
             v.move_cursor(1)
         elif ch == curses.KEY_PPAGE:
-            v.move_cursor(-20)
+            if not v.page_backward():
+                v.move_cursor(-20)
         elif ch == curses.KEY_NPAGE:
-            v.move_cursor(20)
+            if not v.page_forward():
+                v.move_cursor(20)
         elif ch == ord("g"):
             v.jump_top()
         elif ch == ord("G"):
