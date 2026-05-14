@@ -14,6 +14,8 @@ from __future__ import annotations
 import argparse
 import curses
 import datetime as _dt
+from bisect import bisect_right, insort
+from collections import OrderedDict
 import json
 import os
 import re
@@ -326,6 +328,195 @@ class Row:
     text: str
 
 
+@dataclass(frozen=True)
+class StateEntry:
+    ts: str
+    key: str
+    action: str
+    value: str
+    raw: str
+
+    def summary(self) -> str:
+        action = self.action.strip()
+        value = self.value.strip()
+        if not action:
+            return value or "-"
+        if action.lower() == "value":
+            return value or action
+        return f"{action} {value}".strip()
+
+
+@dataclass
+class StateSnapshot:
+    off: int
+    ts: str
+    focus_key: str
+    focus_entry: Optional[StateEntry]
+    family: str
+    family_entries: list[StateEntry]
+    total_keys: int
+
+
+def parse_state_entry(text: str) -> Optional[StateEntry]:
+    parts = text.split("\t")
+    if len(parts) < 3:
+        return None
+    ts = extract_ts_str(text)
+    if ts is None:
+        return None
+    key = parts[1].strip()
+    action = parts[2].strip()
+    value = "\t".join(parts[3:]).strip() if len(parts) > 3 else ""
+    if not key:
+        return None
+    return StateEntry(ts=ts, key=key, action=action, value=value, raw=text)
+
+
+def state_family_for_key(key: str) -> str:
+    key = key.strip()
+    if not key:
+        return ""
+    base = key
+    m = re.match(r"^[A-Z]+_(.+)$", base)
+    if m and len(key.split("_", 1)[0]) <= 2:
+        base = m.group(1)
+    base = base.split(".", 1)[0]
+    if "_" in base:
+        parts = base.split("_")
+        if len(parts) == 2 or re.search(r"[a-z]", parts[0]):
+            return parts[0]
+    return base
+
+
+class StateEngine:
+    def __init__(self, path: str):
+        self.path = path
+        self.size = os.path.getsize(path)
+        self._state_cache: OrderedDict[int, dict[str, StateEntry]] = OrderedDict()
+        self._state_meta: dict[int, tuple[str, str, Optional[StateEntry]]] = {}
+        self._cache_offsets: list[int] = []
+        self._max_cache = 24
+        self._checkpoint_stride = 50000
+
+    def refresh_size(self) -> None:
+        self.size = os.path.getsize(self.path)
+
+    def _cache_put(
+        self,
+        off: int,
+        state: dict[str, StateEntry],
+        ts: str,
+        focus_key: str,
+        focus_entry: Optional[StateEntry],
+    ) -> None:
+        if off in self._state_cache:
+            self._state_cache.move_to_end(off)
+        else:
+            self._state_cache[off] = state
+            insort(self._cache_offsets, off)
+            while len(self._state_cache) > self._max_cache:
+                old_off, _ = self._state_cache.popitem(last=False)
+                idx = bisect_right(self._cache_offsets, old_off) - 1
+                if 0 <= idx < len(self._cache_offsets) and self._cache_offsets[idx] == old_off:
+                    self._cache_offsets.pop(idx)
+                self._state_meta.pop(old_off, None)
+        self._state_cache[off] = state
+        self._state_meta[off] = (ts, focus_key, focus_entry)
+
+    def _nearest_checkpoint(self, off: int) -> Optional[int]:
+        if not self._cache_offsets:
+            return None
+        idx = bisect_right(self._cache_offsets, off) - 1
+        if idx < 0:
+            return None
+        return self._cache_offsets[idx]
+
+    def snapshot_for_offset(self, off: int) -> Optional[StateSnapshot]:
+        self.refresh_size()
+        if off < 0:
+            off = 0
+        off = min(off, self.size)
+        if off in self._state_cache:
+            state = self._state_cache[off]
+            ts, focus_key, focus_entry = self._state_meta.get(off, ("", "", None))
+            return self._make_snapshot(off, state, ts, focus_key, focus_entry)
+
+        base_off = self._nearest_checkpoint(off)
+        if base_off is not None:
+            state = dict(self._state_cache[base_off])
+            start_off = base_off
+            skip_first = True
+        else:
+            state = {}
+            start_off = 0
+            skip_first = False
+
+        focus_entry: Optional[StateEntry] = None
+        focus_key = ""
+        focus_ts = ""
+        event_count = 0
+        with open(self.path, "rb") as f:
+            if skip_first:
+                f.seek(start_off)
+                f.readline()
+            else:
+                f.seek(0)
+            while True:
+                line_off = f.tell()
+                if line_off > off:
+                    break
+                line = f.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", "replace").rstrip("\n")
+                entry = parse_state_entry(text)
+                if entry is None:
+                    continue
+                state[entry.key] = entry
+                event_count += 1
+                if line_off == off:
+                    focus_entry = entry
+                    focus_key = entry.key
+                    focus_ts = entry.ts
+                if event_count % self._checkpoint_stride == 0:
+                    self._cache_put(line_off, dict(state), entry.ts, entry.key, entry)
+
+        if not focus_entry and state:
+            # If off lands beyond the last event or the row text was not parsed,
+            # use the most recent state as the focus.
+            last_entry = next(reversed(state.values()))
+            focus_entry = last_entry
+            focus_key = last_entry.key
+            focus_ts = last_entry.ts
+
+        self._cache_put(off, dict(state), focus_ts, focus_key, focus_entry)
+        return self._make_snapshot(off, state, focus_ts, focus_key, focus_entry)
+
+    def _make_snapshot(
+        self,
+        off: int,
+        state: dict[str, StateEntry],
+        ts: str,
+        focus_key: str,
+        focus_entry: Optional[StateEntry],
+    ) -> StateSnapshot:
+        family = state_family_for_key(focus_key or (focus_entry.key if focus_entry else ""))
+        if family:
+            family_entries = [e for e in state.values() if state_family_for_key(e.key) == family]
+        else:
+            family_entries = []
+        family_entries.sort(key=lambda e: (e.key.lower(), e.key))
+        return StateSnapshot(
+            off=off,
+            ts=ts,
+            focus_key=focus_key,
+            focus_entry=focus_entry,
+            family=family,
+            family_entries=family_entries,
+            total_keys=len(state),
+        )
+
+
 class Viewer:
     def __init__(
         self,
@@ -350,6 +541,7 @@ class Viewer:
         self.include_pat = self.config.get("include_pat", "") if isinstance(self.config.get("include_pat", ""), str) else ""
         self.exclude_pat = self.config.get("exclude_pat", "") if isinstance(self.config.get("exclude_pat", ""), str) else ""
         self.local_time = bool(self.config.get("local_time", False))
+        self.state_panel = bool(self.config.get("state_panel", True))
         self.sessions = clean_sessions(self.config.get("sessions", []))
         self.rows: list[Row] = []
         self.rows_truncated_before = False
@@ -360,6 +552,7 @@ class Viewer:
         self.last_search = ""
         self.last_search_forward = True
         self.follow_mode = False
+        self.state_inspector = False
         self.session_name = (session_name or "").strip()
         self._rows_cache_key: Optional[tuple] = None
         self._center_ts_cache_off: Optional[int] = None
@@ -367,6 +560,7 @@ class Viewer:
         self._focus_off: Optional[int] = None
         self.view_top = 0
         self._recenter_view = True
+        self.state_engine = StateEngine(path)
         if self.session_name:
             session = self.find_session(self.session_name)
             self.apply_session(session, goto, seek_debug)
@@ -392,6 +586,7 @@ class Viewer:
         self.config["include_history"] = self.include_history
         self.config["exclude_history"] = self.exclude_history
         self.config["local_time"] = self.local_time
+        self.config["state_panel"] = self.state_panel
         save_config(self.config)
 
     def save_ui_state(self) -> None:
@@ -400,6 +595,7 @@ class Viewer:
         self.config["include_history"] = self.include_history
         self.config["exclude_history"] = self.exclude_history
         self.config["local_time"] = self.local_time
+        self.config["state_panel"] = self.state_panel
         self.config["sessions"] = self.sessions
         save_config(self.config)
 
@@ -468,6 +664,8 @@ class Viewer:
             self.raw_mode = session["raw_mode"]
         if isinstance(session.get("local_time"), bool):
             self.local_time = session["local_time"]
+        if isinstance(session.get("state_panel"), bool):
+            self.state_panel = session["state_panel"]
 
         if goto:
             self.center_off = find_ts_offset(self.path, goto, seek_debug)
@@ -501,6 +699,7 @@ class Viewer:
             "raw_secs": self.raw_secs,
             "raw_mode": self.raw_mode,
             "local_time": self.local_time,
+            "state_panel": self.state_panel,
         }
         sessions = [entry] + [s for s in self.sessions if s.get("name") != name]
         self.sessions = sessions[:MAX_SESSIONS]
@@ -512,6 +711,62 @@ class Viewer:
         if not bline:
             return None
         return extract_ts_str(bline.decode("utf-8", "replace"))
+
+    def toggle_state_panel(self) -> None:
+        self.state_panel = not self.state_panel
+        self.message = "State panel on" if self.state_panel else "State panel off"
+        self.save_ui_state()
+
+    def toggle_state_inspector(self) -> None:
+        self.state_inspector = not self.state_inspector
+        self.message = "State inspector on" if self.state_inspector else "State inspector off"
+
+    def state_snapshot(self) -> Optional[StateSnapshot]:
+        return self.state_engine.snapshot_for_offset(self.selected_offset())
+
+    def format_state_entry(self, entry: StateEntry, width: int, focus: bool = False) -> str:
+        marker = ">" if focus else " "
+        key_width = max(16, min(34, width // 3))
+        key = entry.key[:key_width].ljust(key_width)
+        summary = entry.summary()
+        return f"{marker} {key}  {summary}"[: max(0, width - 1)]
+
+    def state_panel_lines(self, width: int, height: int, snapshot: Optional[StateSnapshot]) -> list[str]:
+        if height <= 0:
+            return []
+        if not snapshot:
+            return ["State unavailable"]
+        lines: list[str] = []
+        ts = snapshot.ts or self.center_ts() or "no-ts"
+        mode = "INSPECT" if self.state_inspector else "STATE"
+        header = f"{mode} @ {ts}  keys={snapshot.total_keys}"
+        if snapshot.family:
+            header += f"  family={snapshot.family}"
+        lines.append(header[: width - 1])
+        if snapshot.focus_entry:
+            lines.append(self.format_state_entry(snapshot.focus_entry, width, focus=True))
+        elif snapshot.focus_key:
+            lines.append(f"> {snapshot.focus_key}"[: width - 1])
+        else:
+            lines.append("> no focused state"[: width - 1])
+
+        family = snapshot.family or snapshot.focus_key
+        if family:
+            lines.append(f"family snapshot: {family}"[: width - 1])
+        else:
+            lines.append("family snapshot: none"[: width - 1])
+
+        remaining = max(0, height - len(lines))
+        family_entries = [e for e in snapshot.family_entries if e.key != snapshot.focus_key]
+        if not family_entries:
+            lines.append("No grouped state entries for this focus."[: width - 1])
+        else:
+            for entry in family_entries[:remaining]:
+                lines.append(self.format_state_entry(entry, width))
+            if len(family_entries) > remaining:
+                lines.append(f"... {len(family_entries) - remaining} more"[: width - 1])
+
+        return lines[:height]
 
     def row_matches(self, text: str) -> bool:
         if self.include_re and not self.include_re.search(text):
@@ -1164,28 +1419,57 @@ def pick_session(
 def draw(stdscr, v: Viewer) -> None:
     stdscr.erase()
     h, w = stdscr.getmaxyx()
-    v.build_rows(h - 3)
+    inspector = v.state_inspector
+    state_panel = v.state_panel and not inspector
+    panel_h = 0
+    if inspector:
+        log_h = max(1, h - 3)
+        panel_h = max(1, h - 3)
+    elif state_panel and h >= 12:
+        panel_h = max(6, min(max(6, h // 3), max(6, h - 6)))
+        log_h = max(1, h - 3 - panel_h)
+    else:
+        log_h = max(1, h - 3)
+    full_body_h = max(1, h - 3)
+    v.build_rows(full_body_h)
     mode = "RAW" if v.raw_mode else "FILTER"
     ts = v.display_ts()
     follow = " FOLLOW" if v.follow_mode else ""
     local = " LOCAL" if v.local_time else ""
     session = f" session={v.session_name!r}" if v.session_name else ""
-    header = f"{mode}{follow}{local} {os.path.basename(v.path)} @ {ts}{session}  win={v.window_secs:g}s raw={v.raw_secs:g}s  i={v.include_pat!r} x={v.exclude_pat!r}"
+    state_flag = " INSPECT" if inspector else (" STATE" if state_panel else "")
+    header = f"{mode}{follow}{local}{state_flag} {os.path.basename(v.path)} @ {ts}{session}  win={v.window_secs:g}s raw={v.raw_secs:g}s  i={v.include_pat!r} x={v.exclude_pat!r}"
     stdscr.addstr(0, 0, header[: w - 1], curses.A_REVERSE)
-    help_line = "g top  G bottom  j time  F follow  t local  s save session  / ? search  n/N repeat  i include  x exclude  c clear  r raw  w/R seconds  ↑/↓ move; prompt ↑/↓ history  q quit"
+    help_line = "g top  G bottom  j time  F follow  t local  m state  M inspect  s save session  / ? search  n/N repeat  i include  x exclude  c clear  r raw  w/R seconds  ↑/↓ move; prompt ↑/↓ history  q quit"
     stdscr.addstr(1, 0, help_line[: w - 1], curses.A_DIM)
 
-    max_body = h - 3
-    if v.rows:
+    body_h = log_h
+    if v.rows and not inspector:
         # Render the current viewport instead of recentering every redraw.
-        start = max(0, min(v.view_top, max(0, len(v.rows) - max_body)))
-        for y, idx in enumerate(range(start, min(len(v.rows), start + max_body)), start=2):
+        start = max(0, min(v.view_top, max(0, len(v.rows) - body_h)))
+        for y, idx in enumerate(range(start, min(len(v.rows), start + body_h)), start=2):
             row = v.rows[idx]
             attr = curses.A_REVERSE if idx == v.cursor else curses.A_NORMAL
             prefix = "> " if idx == v.cursor else "  "
             stdscr.addstr(y, 0, (prefix + v.format_row_text(row.text))[: w - 1], attr)
-    else:
+    elif not inspector:
         stdscr.addstr(2, 0, "No rows in current window/filter"[: w - 1])
+
+    show_state = inspector or (state_panel and panel_h > 0)
+    if show_state:
+        snapshot = v.state_snapshot()
+        state_lines = v.state_panel_lines(w, panel_h if inspector else panel_h, snapshot)
+        if not inspector:
+            split_y = 2 + body_h
+            if split_y < h - 1:
+                stdscr.addstr(split_y, 0, ("-" * max(1, w - 1))[: w - 1], curses.A_DIM)
+            y0 = split_y + 1
+        else:
+            y0 = 2
+        for i, line in enumerate(state_lines):
+            if y0 + i >= h - 1:
+                break
+            stdscr.addstr(y0 + i, 0, line[: w - 1], curses.A_BOLD if i == 0 else curses.A_NORMAL)
 
     if v.message:
         stdscr.addstr(h - 1, 0, v.message[: w - 1], curses.A_REVERSE)
@@ -1302,6 +1586,10 @@ def main_curses(stdscr, v: Viewer) -> None:
             v.save_active_session_state()
         elif ch == ord("t"):
             v.toggle_local_time()
+        elif ch == ord("m"):
+            v.toggle_state_panel()
+        elif ch == ord("M"):
+            v.toggle_state_inspector()
         elif ch == ord("w"):
             s = prompt(stdscr, "filtered window seconds", str(v.window_secs))
             if s:
