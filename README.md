@@ -5,11 +5,14 @@ CWLogViewer is a terminal viewer for large Clockwork-style logs with timestamped
 ## Features
 
 - Timestamp seek with `--goto`
+- Session load/create with `--session`
 - Include/exclude regex filters
 - Persistent filter history and active filter state in `~/.cwlog`
 - Startup session naming that records the current file position and active filters
+- Session picker for loading or creating sessions at startup and from the `s` command
 - Less-style navigation keys
 - Follow/tail mode for watching appended log lines
+- Local-time rendering toggle
 
 ## Requirements
 
@@ -21,6 +24,7 @@ CWLogViewer is a terminal viewer for large Clockwork-style logs with timestamped
 ```bash
 python3 cwlog_view.py /path/to/logfile
 python3 cwlog_view.py /path/to/logfile --goto 20260514T033456.507596Z
+python3 cwlog_view.py /path/to/logfile --session morning-shift
 ```
 
 `--seek-debug` prints timestamp seek diagnostics before opening the UI.
@@ -29,7 +33,10 @@ python3 cwlog_view.py /path/to/logfile --goto 20260514T033456.507596Z
 
 - `g` go to the top of the file
 - `G` go to the bottom of the file
+- `j` jump to a timestamp
 - `F` toggle follow/tail mode
+- `t` toggle local-time rendering
+- `s` save the current view as a named session
 - `/` search forward
 - `?` search backward
 - `n` repeat the last search in the same direction
@@ -44,7 +51,9 @@ python3 cwlog_view.py /path/to/logfile --goto 20260514T033456.507596Z
 - `PageUp` and `PageDown` move faster
 - `q` quit
 
+When local-time rendering is enabled, `j` accepts local wall-clock times. Otherwise it accepts UTC timestamps.
 When follow mode is enabled, any browsing key breaks out of follow mode and returns to normal browsing.
+At startup, if saved sessions exist, the viewer shows a picker. Choose an existing session or pick "New session..." to create one.
 
 ## Saved State
 
@@ -64,9 +73,14 @@ Named session records capture:
 - Active filters
 - Window sizes
 - Raw mode state
+- Local-time preference
+- Preferred jump timestamp for reopening on another file
+
+Saved sessions can be picked from the startup picker or the `s` command.
 
 ## Notes
 
 - Filters are restored on launch, so you do not need to re-enter them every time.
 - If a filter regex is invalid, the viewer reports the regex error in the status line.
 - Follow mode is intended for tailing the end of the file while it grows; use `F` again or any browsing key to leave it.
+- If a session is opened on a different file, the viewer jumps to the saved timestamp when available, otherwise it falls back to around `06:00` on the file's first day.
